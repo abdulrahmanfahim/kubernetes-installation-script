@@ -1,111 +1,138 @@
 #!/bin/bash
 
-# --- 1. THE "NETCTL" SYSTEM TOOL ---
-# This creates a persistent tool to manage networking in the future
+# --- 1. CONFIG & GLOBALS ---
+ORIGINAL_RESOLV="/etc/resolv.conf.bak"
+STAGES_COMPLETED=()
+REQUIRED_DISK_GB=5
+
+# --- 2. THE NUCLEAR ROLLBACK (The "Undo Everything" Engine) ---
+cleanup_on_failure() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo -e "\n\e[31m[!] CRITICAL FAILURE. Initiating Full Rollback...\e[0m"
+        
+        # 1. Uninstall K3s
+        if [[ " ${STAGES_COMPLETED[*]} " =~ " k3s_install " ]]; then
+            [ -f /usr/local/bin/k3s-uninstall.sh ] && /usr/local/bin/k3s-uninstall.sh
+            [ -f /usr/local/bin/k3s-agent-uninstall.sh ] && /usr/local/bin/k3s-agent-uninstall.sh
+        fi
+
+        # 2. Restore DNS & systemd-resolved
+        if [[ " ${STAGES_COMPLETED[*]} " =~ " dns_config " ]]; then
+            mv "$ORIGINAL_RESOLV" /etc/resolv.conf 2>/dev/null
+            systemctl enable --now systemd-resolved 2>/dev/null
+        fi
+
+        # 3. Re-enable Swap (if we disabled it)
+        if [[ " ${STAGES_COMPLETED[*]} " =~ " swap_off " ]]; then
+            swapon -a
+        fi
+
+        # 4. Remove custom tools
+        rm -f /usr/local/bin/netctl
+        
+        echo -e "\e[32m[+] System restored to pre-install state.\e[0m"
+    fi
+    exit $exit_code
+}
+
+trap cleanup_on_failure ERR SIGINT SIGTERM
+
+# --- 3. HARDWARE & OS VALIDATION ---
+validate_system() {
+    echo "🛡️ Validating System Requirements..."
+    
+    # Check Disk Space
+    AVAILABLE_DISK=$(df / --output=avail -G | tail -n1)
+    if [ "$AVAILABLE_DISK" -lt "$REQUIRED_DISK_GB" ]; then
+        echo "Error: Need at least ${REQUIRED_DISK_GB}GB free space." && exit 1
+    fi
+
+    # Disable Swap (K8s Requirement)
+    echo "🚫 Disabling Swap..."
+    sed -i '/swap/d' /etc/fstab
+    swapoff -a
+    STAGES_COMPLETED+=("swap_off")
+
+    # Detect OS
+    [ -f /etc/os-release ] && . /etc/os-release || exit 1
+    echo "Detected: $PRETTY_NAME"
+}
+
+# --- 4. ENVIRONMENT PREP ---
+setup_env() {
+    echo "📦 Installing Project Essentials..."
+    case "$ID" in
+        ubuntu|debian)
+            apt-get update && apt-get install -y curl wget git net-tools open-iscsi nfs-common dialog
+            ufw disable 2>/dev/null # K3s manages its own networking
+            ;;
+        fedora|rhel)
+            dnf install -y curl wget git net-tools iscsi-initiator-utils nfs-utils dialog
+            systemctl stop firewalld && systemctl disable firewalld
+            ;;
+    esac
+
+    # DNS Lock
+    cp /etc/resolv.conf "$ORIGINAL_RESOLV"
+    systemctl disable --now systemd-resolved 2>/dev/null
+    rm -f /etc/resolv.conf
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+    STAGES_COMPLETED+=("dns_config")
+}
+
+# --- 5. THE NETCTL TOOL CREATION ---
 create_netctl() {
     cat << 'EOF' > /usr/local/bin/netctl
 #!/bin/bash
-# Usage: netctl <static_ip> <gateway>
 if [ -z "$1" ] || [ -z "$2" ]; then
-    echo "Usage: netctl 192.168.1.120 192.168.1.1"
+    echo "Usage: sudo netctl <IP> <GATEWAY>"
     exit 1
 fi
-
 cat << EOM > /etc/netplan/01-netcfg.yaml
 network:
   version: 2
   renderer: networkd
   ethernets:
-    eth0:
+    $(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n1):
       dhcp4: no
       addresses: [$1/24]
       gateway4: $2
       nameservers:
         addresses: [8.8.8.8, 1.1.1.1]
 EOM
-netplan apply && echo "Network updated to $1"
+netplan apply && echo "Network set to $1"
 EOF
     chmod +x /usr/local/bin/netctl
 }
 
-# --- 2. OS & PRE-FLIGHT (Essential Tools & DNS) ---
-setup_environment() {
-    echo "🔍 Detecting OS..."
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$ID
-    fi
+# --- 6. K3S INSTALLATION WIZARD ---
+install_k3s() {
+    ROLE=$(dialog --clear --title "K3s Deployer" --menu "Role:" 12 35 2 \
+          "Master" "Control Plane" "Worker" "Agent" 3>&1 1>&2 2>&3)
 
-    echo "📦 Installing Essential Tools for $OS..."
-    case "$OS" in
-        ubuntu|debian)
-            apt-get update && apt-get install -y curl wget git net-tools open-iscsi nfs-common grep sed dialog
-            ;;
-        fedora|rhel)
-            dnf install -y curl wget git net-tools iscsi-initiator-utils nfs-utils grep sed dialog
-            ;;
-        arch)
-            pacman -Sy --noconfirm curl wget git net-tools open-iscsi nfs-utils grep sed dialog
-            ;;
-    esac
-
-    echo "🔌 Disabling systemd-resolved and locking DNS..."
-    systemctl disable --now systemd-resolved
-    rm -f /etc/resolv.conf
-    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
-    
-    create_netctl
-}
-
-# --- 3. DYNAMIC NODE LOGIC ---
-generate_node_name() {
-    local host=$(hostname)
-    if [[ "$host" == "localhost" ]] || [[ -z "$host" ]]; then
-        echo "node-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
-    else
-        echo "$host"
-    fi
-}
-
-# --- 4. THE INSTALLER WIZARD ---
-run_installer() {
-    # 4a. Role Selection
-    CHOICE=$(dialog --clear --title "K3s Universal Installer" \
-            --menu "Select Node Role:" 15 40 2 \
-            "Master" "Install as Control Plane" \
-            "Worker" "Join existing Cluster" \
-            3>&1 1>&2 2>&3)
-
-    if [ "$CHOICE" == "Master" ]; then
-        echo "🚀 Installing K3s Master (Traefik Disabled)..."
-        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" \
-             K3S_KUBECONFIG_MODE="644" sh -s -
+    if [ "$ROLE" == "Master" ]; then
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" K3S_KUBECONFIG_MODE="644" sh -s -
+        STAGES_COMPLETED+=("k3s_install")
         
-        echo "✅ MASTER READY."
-        echo "------------------------------------------------"
-        echo "TOKEN: $(cat /var/lib/rancher/k3s/server/node-token)"
-        echo "IP: $(hostname -I | awk '{print $1}')"
-        echo "------------------------------------------------"
-    
-    elif [ "$CHOICE" == "Worker" ]; then
-        MASTER_IP=$(dialog --inputbox "Enter Master Node IP:" 8 40 3>&1 1>&2 2>&3)
-        MASTER_TOKEN=$(dialog --inputbox "Enter Master Node Token:" 8 40 3>&1 1>&2 2>&3)
-        NODE_NAME=$(generate_node_name)
-
-        echo "🚀 Joining Cluster as $NODE_NAME..."
-        curl -sfL https://get.k3s.io | K3S_TOKEN="$MASTER_TOKEN" \
-             K3S_URL="https://${MASTER_IP}:6443" \
-             K3S_NODE_NAME="$NODE_NAME" sh -
+        # Install Ingress-Nginx
+        echo "🌐 Deploying Nginx Ingress Controller..."
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+        
+    else
+        M_IP=$(dialog --inputbox "Master IP:" 8 40 3>&1 1>&2 2>&3)
+        M_TOKEN=$(dialog --inputbox "Master Token:" 8 40 3>&1 1>&2 2>&3)
+        curl -sfL https://get.k3s.io | K3S_TOKEN="$M_TOKEN" K3S_URL="https://${M_IP}:6443" K3S_NODE_NAME="$(hostname)" sh -
+        STAGES_COMPLETED+=("k3s_install")
     fi
 }
 
 # --- EXECUTION ---
-if [[ $EUID -ne 0 ]]; then 
-   echo "This script must be run as root (sudo)." 
-   exit 1
-fi
+[[ $EUID -ne 0 ]] && echo "Must run as root" && exit 1
 
-setup_environment
-run_installer
+validate_system
+setup_env
+create_netctl
+install_k3s
 
-echo "Done! Use 'netctl' to change networking in the future."
+echo -e "\n\e[32m🌟 SUCCESS: Node is ready. Use 'netctl' for future IP changes.\e[0m"
