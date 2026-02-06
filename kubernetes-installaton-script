@@ -1,0 +1,111 @@
+#!/bin/bash
+
+# --- 1. THE "NETCTL" SYSTEM TOOL ---
+# This creates a persistent tool to manage networking in the future
+create_netctl() {
+    cat << 'EOF' > /usr/local/bin/netctl
+#!/bin/bash
+# Usage: netctl <static_ip> <gateway>
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Usage: netctl 192.168.1.120 192.168.1.1"
+    exit 1
+fi
+
+cat << EOM > /etc/netplan/01-netcfg.yaml
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth0:
+      dhcp4: no
+      addresses: [$1/24]
+      gateway4: $2
+      nameservers:
+        addresses: [8.8.8.8, 1.1.1.1]
+EOM
+netplan apply && echo "Network updated to $1"
+EOF
+    chmod +x /usr/local/bin/netctl
+}
+
+# --- 2. OS & PRE-FLIGHT (Essential Tools & DNS) ---
+setup_environment() {
+    echo "🔍 Detecting OS..."
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+    fi
+
+    echo "📦 Installing Essential Tools for $OS..."
+    case "$OS" in
+        ubuntu|debian)
+            apt-get update && apt-get install -y curl wget git net-tools open-iscsi nfs-common grep sed dialog
+            ;;
+        fedora|rhel)
+            dnf install -y curl wget git net-tools iscsi-initiator-utils nfs-utils grep sed dialog
+            ;;
+        arch)
+            pacman -Sy --noconfirm curl wget git net-tools open-iscsi nfs-utils grep sed dialog
+            ;;
+    esac
+
+    echo "🔌 Disabling systemd-resolved and locking DNS..."
+    systemctl disable --now systemd-resolved
+    rm -f /etc/resolv.conf
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+    
+    create_netctl
+}
+
+# --- 3. DYNAMIC NODE LOGIC ---
+generate_node_name() {
+    local host=$(hostname)
+    if [[ "$host" == "localhost" ]] || [[ -z "$host" ]]; then
+        echo "node-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 6 | head -n 1)"
+    else
+        echo "$host"
+    fi
+}
+
+# --- 4. THE INSTALLER WIZARD ---
+run_installer() {
+    # 4a. Role Selection
+    CHOICE=$(dialog --clear --title "K3s Universal Installer" \
+            --menu "Select Node Role:" 15 40 2 \
+            "Master" "Install as Control Plane" \
+            "Worker" "Join existing Cluster" \
+            3>&1 1>&2 2>&3)
+
+    if [ "$CHOICE" == "Master" ]; then
+        echo "🚀 Installing K3s Master (Traefik Disabled)..."
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" \
+             K3S_KUBECONFIG_MODE="644" sh -s -
+        
+        echo "✅ MASTER READY."
+        echo "------------------------------------------------"
+        echo "TOKEN: $(cat /var/lib/rancher/k3s/server/node-token)"
+        echo "IP: $(hostname -I | awk '{print $1}')"
+        echo "------------------------------------------------"
+    
+    elif [ "$CHOICE" == "Worker" ]; then
+        MASTER_IP=$(dialog --inputbox "Enter Master Node IP:" 8 40 3>&1 1>&2 2>&3)
+        MASTER_TOKEN=$(dialog --inputbox "Enter Master Node Token:" 8 40 3>&1 1>&2 2>&3)
+        NODE_NAME=$(generate_node_name)
+
+        echo "🚀 Joining Cluster as $NODE_NAME..."
+        curl -sfL https://get.k3s.io | K3S_TOKEN="$MASTER_TOKEN" \
+             K3S_URL="https://${MASTER_IP}:6443" \
+             K3S_NODE_NAME="$NODE_NAME" sh -
+    fi
+}
+
+# --- EXECUTION ---
+if [[ $EUID -ne 0 ]]; then 
+   echo "This script must be run as root (sudo)." 
+   exit 1
+fi
+
+setup_environment
+run_installer
+
+echo "Done! Use 'netctl' to change networking in the future."
